@@ -1,0 +1,8 @@
+2024/02/03 (Sat)
+10:00	Demo User A	The next three date lines are deliberately impossible
+2024/02/30 (Fri)
+10:05	Demo User B	This line still belongs to Feb 3 (Feb 30 does not exist)
+12/31/2024
+10:10	Demo User A	Month/day/year is not read as a date
+2023/02/29
+10:15	Demo User B	2023 has no Feb 29

@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Date extractor — LINE chat tools</title>
+<style>
+  :root {
+    --bg: #f5f3ef; --card: #ffffff; --ink: #2b2a27; --sub: #807c74;
+    --accent: #b05730; --accent-soft: #f3e3d9; --border: #e4e0d8;
+    --ok: #3a7d44; --warn: #a16a07; --err: #b3261e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Microsoft JhengHei", sans-serif;
+    background: var(--bg); color: var(--ink); min-height: 100vh; padding: 40px 16px;
+  }
+  .wrap { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 6px; }
+  .sub { color: var(--sub); font-size: 13px; margin-bottom: 24px; line-height: 1.6; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+  #drop {
+    border: 2px dashed var(--border); border-radius: 14px; padding: 36px 20px;
+    text-align: center; cursor: pointer; background: var(--card); font-size: 14px; color: var(--sub);
+  }
+  #drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  #drop .big { font-size: 16px; font-weight: 600; color: var(--ink); margin-bottom: 6px; }
+  .note { font-size: 12px; color: var(--sub); line-height: 1.7; }
+  #pickWarn { white-space: pre-line; text-align: left; margin-top: 8px; font-size: 12px; line-height: 1.7; }
+  #pickWarn .warn, #pickWarn .err { display: block; }
+  .range { display: flex; gap: 12px; align-items: flex-end; }
+  .range .field { flex: 1; }
+  .range .arrow { padding-bottom: 12px; color: var(--sub); }
+  label.fl { display: block; font-size: 13px; color: var(--sub); margin-bottom: 5px; }
+  input[type=text] {
+    width: 100%; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 16px; background: #fcfbf9; color: var(--ink); letter-spacing: 1px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  #run {
+    width: 100%; padding: 14px; border: none; border-radius: 10px; background: var(--accent);
+    color: #fff; font-size: 16px; font-weight: 600; cursor: pointer;
+  }
+  #run:disabled { opacity: .35; cursor: default; }
+  #status { margin-top: 14px; font-size: 14px; line-height: 1.8; display: none; }
+  #status.show { display: block; }
+  .ok { color: var(--ok); font-weight: 600; }
+  .warn { color: var(--warn); font-weight: 600; }
+  .err { color: var(--err); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Date extractor</h1>
+  <div class="sub">Pull a date range out of LINE chat exports (.txt) into a single .txt file.
+    Your files are processed in this browser and never uploaded.</div>
+
+  <div id="drop">
+    <div class="big">Click to choose, or drop .txt or .zip files here</div>
+    <div>Several .txt files, or one .zip containing them — processed in file-name order</div>
+    <div class="note" id="pickSummary" style="margin-top:8px"></div>
+    <div id="pickWarn"></div>
+  </div>
+  <input type="file" id="fileInput" accept=".txt,.zip" multiple style="display:none">
+
+  <div class="card" style="margin-top:16px">
+    <div class="range">
+      <div class="field">
+        <label class="fl" for="fromInput">From (YYYYMMDD)</label>
+        <input type="text" id="fromInput" placeholder="20240101" inputmode="numeric">
+      </div>
+      <div class="arrow">→</div>
+      <div class="field">
+        <label class="fl" for="toInput">To (YYYYMMDD)</label>
+        <input type="text" id="toInput" placeholder="20240229" inputmode="numeric">
+      </div>
+    </div>
+    <div class="note" style="margin-top:8px">Both days are included. 2024-01-01 and 2024/01/01 also work.
+      Dates that do not exist (such as 30 February) are rejected.</div>
+  </div>
+
+  <button id="run" disabled>Extract</button>
+  <div id="status"></div>
+
+  <div class="note" style="margin-top:20px">
+    Limits: 50 MB per .txt (or per file inside a zip), 100 MB per zip, 200 MB per run after unzipping;
+    encrypted zips and ZIP64 are not supported. Dates written x/y/YYYY are always read as day/month/year.
+  </div>
+</div>
+
+<script id="core-logic">
+/* ============ Shared core: limits, dates, text decoding, zip reading.
+   Byte-identical in date-extractor.html, splitter.html and merger.html (a test checks this). ============ */
+const LIMITS = {
+  maxFileBytes: 50 * 1024 * 1024,     // one .txt or .docx (or one .txt inside a zip)
+  maxZipBytes: 100 * 1024 * 1024,     // one .zip file
+  maxTotalBytes: 200 * 1024 * 1024,   // everything in one run, after unzipping
+  maxZipEntries: 5000,                // entries inside one zip
+  maxOutputFiles: 5000                // files written into one output zip
+};
+const mb = n => Math.round(n / 1024 / 1024) + ' MB';
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* ---- date lines ---- */
+// A line that is only a date: 2024/01/30, 2024-01-30, 2024.01.30, 2024年1月30日 or 30/01/2024,
+// optionally followed by a weekday — in brackets, (Tue) （二） (火) (월), or written out: Tuesday, Tue., Thurs, 星期二, 週二, 火曜日.
+// Only real weekday names count. Anything else after the date ("2024/03/01休假", "2024/03/01 day off",
+// "2024/03/01 Monsoon", "2024/03/01 (lol)") makes it a message line.
+const DATE_LINE_RE = /^\s*(?:(\d{4})[\/.\-年](\d{1,2})[\/.\-月](\d{1,2})日?|(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4}))\s*(?:[（(](?:(?:Mon(?:day)?|Tue(?:s(?:day)?)?|Wed(?:nesday)?|Thu(?:r(?:s(?:day)?)?)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\.?|(?:星期|週|周|禮拜|礼拜)?[一二三四五六日天]|[月火水木金土日](?:曜日?)?|[월화수목금토일](?:요일)?)[）)]|(?:Mon(?:day)?|Tue(?:s(?:day)?)?|Wed(?:nesday)?|Thu(?:r(?:s(?:day)?)?)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\.?|(?:星期|週|周|禮拜|礼拜)[一二三四五六日天]|[月火水木金土日]曜日?)?\s*$/i;
+
+function isRealDate(y, mo, d) {
+  if (y < 1990 || y > 2100 || mo < 1 || mo > 12 || d < 1) return false;
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  return d <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1];
+}
+// Date-shaped line → {y, mo, d, valid}; anything else → null.
+// The 4-digit group decides where the year is: 30/12/2024 is day-first, 2024/12/30 is year-first.
+function matchDateLine(line) {
+  const m = DATE_LINE_RE.exec(line);
+  if (!m) return null;
+  let y, mo, d;
+  if (m[1] !== undefined) { y = +m[1]; mo = +m[2]; d = +m[3]; }
+  else { d = +m[4]; mo = +m[5]; y = +m[6]; }
+  return { y, mo, d, valid: isRealDate(y, mo, d) };
+}
+// Date line → YYYYMMDD integer; not a date line, or a date that does not exist → null
+function parseDateLineYMD(line) {
+  const r = matchDateLine(line);
+  return r && r.valid ? r.y * 10000 + r.mo * 100 + r.d : null;
+}
+
+// User input → YYYYMMDD integer (accepts 2024-01-01, 2024/01/01, 20240101)
+function parseUserDate(s) {
+  const digits = String(s || '').replace(/\D/g, '');
+  if (digits.length !== 8) return null;
+  const y = +digits.slice(0, 4), mo = +digits.slice(4, 6), d = +digits.slice(6, 8);
+  return isRealDate(y, mo, d) ? y * 10000 + mo * 100 + d : null;
+}
+
+function fmtYMD(n) {
+  const s = String(n);
+  return s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8);
+}
+
+/* ---- text decoding: BOM → strict UTF-8 → Big5 ---- */
+function decodeTextSmart(input) {
+  const u8 = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (u8[0] === 0xFF && u8[1] === 0xFE) return new TextDecoder('utf-16le').decode(u8);
+  if (u8[0] === 0xFE && u8[1] === 0xFF) return new TextDecoder('utf-16be').decode(u8);
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(u8); }
+  catch (e) {
+    try { return new TextDecoder('big5').decode(u8); }
+    catch (e2) { return new TextDecoder('utf-8').decode(u8); }
+  }
+}
+
+/* ---- CRC32 (zip reading checks it; zip writing uses it) ---- */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+
+/* ---- zip reading ---- */
+function findEocd(view) {
+  const len = view.byteLength;
+  if (len < 22) throw new Error('Not a valid zip file');
+  const maxBack = Math.min(len, 65557);
+  for (let i = len - 22; i >= len - maxBack; i--) {
+    if (view.getUint32(i, true) === 0x06054b50) return i;
+  }
+  throw new Error('Not a valid zip file');
+}
+// Returns an array (entries with the same name are kept; the caller decides about duplicates)
+function parseZipEntries(arrayBuffer) {
+  const view = new DataView(arrayBuffer);
+  const eocd = findEocd(view);
+  const count = view.getUint16(eocd + 10, true);
+  const cdOff = view.getUint32(eocd + 16, true);
+  if (count === 0xFFFF || cdOff === 0xFFFFFFFF) throw new Error('ZIP64 archives are not supported');
+  if (count > LIMITS.maxZipEntries) throw new Error('The zip has more than ' + LIMITS.maxZipEntries + ' entries');
+  let off = cdOff;
+  const entries = [];
+  for (let i = 0; i < count; i++) {
+    if (off + 46 > view.byteLength || view.getUint32(off, true) !== 0x02014b50) throw new Error('The zip file is damaged');
+    const flags = view.getUint16(off + 8, true);
+    const method = view.getUint16(off + 10, true);
+    const crc = view.getUint32(off + 16, true);
+    const compSize = view.getUint32(off + 20, true);
+    const size = view.getUint32(off + 24, true);
+    const nameLen = view.getUint16(off + 28, true);
+    const extraLen = view.getUint16(off + 30, true);
+    const commentLen = view.getUint16(off + 32, true);
+    const localOff = view.getUint32(off + 42, true);
+    if (compSize === 0xFFFFFFFF || size === 0xFFFFFFFF || localOff === 0xFFFFFFFF) throw new Error('ZIP64 archives are not supported');
+    const name = new TextDecoder('utf-8').decode(new Uint8Array(arrayBuffer, off + 46, nameLen));
+    entries.push({ name, method, crc, compSize, size, localOff, encrypted: (flags & 1) === 1 });
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+// Unpack one entry; stops as soon as the output passes `cap` bytes (zip-bomb guard)
+async function extractZipEntry(arrayBuffer, entry, cap) {
+  if (entry.encrypted) throw new Error('Encrypted zips are not supported');
+  if (entry.size > cap) throw new Error('Unpacked size is over the limit');
+  const view = new DataView(arrayBuffer);
+  const lo = entry.localOff;
+  if (lo + 30 > view.byteLength || view.getUint32(lo, true) !== 0x04034b50) throw new Error('The zip file is damaged');
+  const nameLen = view.getUint16(lo + 26, true);
+  const extraLen = view.getUint16(lo + 28, true);
+  const dataStart = lo + 30 + nameLen + extraLen;
+  if (dataStart + entry.compSize > view.byteLength) throw new Error('The zip file is damaged');
+  const raw = new Uint8Array(arrayBuffer.slice(dataStart, dataStart + entry.compSize));
+  let out;
+  if (entry.method === 0) out = raw;
+  else if (entry.method === 8) {
+    const reader = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > cap) { await reader.cancel(); throw new Error('Unpacked size is over the limit'); }
+      chunks.push(value);
+    }
+    out = new Uint8Array(total);
+    let p = 0;
+    for (const c of chunks) { out.set(c, p); p += c.length; }
+  } else throw new Error('Unsupported compression method: ' + entry.method);
+  if (out.length !== entry.size) throw new Error('Size mismatch inside the zip (the file may be damaged)');
+  if (crc32(out) !== entry.crc) throw new Error('CRC mismatch inside the zip (the file is damaged)');
+  return out;
+}
+
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// Chosen files (.txt or .zip) → { items: [{name, bytes}] sorted by name, notices: [], errors: [] }
+// Same name: identical content is used once (with a notice); different content is an error,
+// because the processing order comes from the file names.
+async function collectTxtInputs(files) {
+  const items = [], notices = [], errors = [], skipped = [];
+  let total = 0;
+  const overTotal = () => errors.push('The total size is over the limit of ' + mb(LIMITS.maxTotalBytes));
+  outer:
+  for (const f of files) {
+    const n = f.name.toLowerCase();
+    if (n.endsWith('.txt')) {
+      if (f.size > LIMITS.maxFileBytes) { errors.push(f.name + ' is over the per-file limit of ' + mb(LIMITS.maxFileBytes)); continue; }
+      if (total + f.size > LIMITS.maxTotalBytes) { overTotal(); break; }
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      total += bytes.length;
+      items.push({ name: f.name, bytes });
+    } else if (n.endsWith('.zip')) {
+      if (f.size > LIMITS.maxZipBytes) { errors.push(f.name + ' is over the zip limit of ' + mb(LIMITS.maxZipBytes)); continue; }
+      try {
+        const buf = await f.arrayBuffer();
+        for (const e of parseZipEntries(buf)) {
+          if (e.name.endsWith('/')) continue;
+          if (e.name.startsWith('__MACOSX/') || e.name.includes('/__MACOSX/')) continue;
+          const base = e.name.split('/').pop();
+          if (!base || base.startsWith('.')) continue;
+          if (!base.toLowerCase().endsWith('.txt')) { skipped.push(f.name + ' › ' + e.name); continue; }
+          if (e.encrypted) { errors.push(f.name + ' › ' + e.name + ': encrypted zips are not supported'); continue; }
+          if (e.size > LIMITS.maxFileBytes) { errors.push(f.name + ' › ' + e.name + ' is over the per-file limit of ' + mb(LIMITS.maxFileBytes)); continue; }
+          if (total + e.size > LIMITS.maxTotalBytes) { overTotal(); break outer; }
+          const bytes = await extractZipEntry(buf, e, LIMITS.maxTotalBytes - total);
+          total += bytes.length;
+          items.push({ name: base, bytes });
+        }
+      } catch (err) {
+        errors.push(f.name + ': ' + (err && err.message ? err.message : err));
+      }
+    } else {
+      skipped.push(f.name);
+    }
+  }
+  if (skipped.length) notices.push('Skipped files that are not .txt: ' + skipped.join(', '));
+
+  const byName = new Map();
+  for (const it of items) {
+    if (!byName.has(it.name)) byName.set(it.name, []);
+    byName.get(it.name).push(it);
+  }
+  const unique = [], same = [], conflicts = [];
+  for (const [name, list] of byName) {
+    unique.push(list[0]);
+    if (list.length > 1) {
+      if (list.every(x => bytesEqual(x.bytes, list[0].bytes))) same.push(name + ' (×' + list.length + ')');
+      else conflicts.push(name);
+    }
+  }
+  if (same.length) notices.push('Same name and same content, used once: ' + same.join(', '));
+  if (conflicts.length) errors.push('These file names appear more than once with different content, so the order is unclear. Rename them and choose again: ' + conflicts.join(', '));
+  unique.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return { items: unique, notices, errors };
+}
+
+/* ============ Extraction ============ */
+// texts: file contents, already sorted by file name. Walks line by line keeping the
+// "current date", which carries over between files (a day can be cut across two files).
+function extractRange(texts, from, to) {
+  let cur = null;
+  const out = [];
+  const hitDates = new Set();
+  let minD = null, maxD = null;
+  let headerLines = 0, invalidDateLines = 0;
+  for (const t of texts) {
+    const lines = t.replace(/\r\n|\r/g, '\n').split('\n');
+    for (const line of lines) {
+      const m = matchDateLine(line);
+      if (m && m.valid) {
+        const d = m.y * 10000 + m.mo * 100 + m.d;
+        cur = d;
+        if (minD === null || d < minD) minD = d;
+        if (maxD === null || d > maxD) maxD = d;
+      } else if (m) {
+        invalidDateLines++;   // looks like a date but does not exist (e.g. 2024/02/30 or month/day/year) → normal content
+      }
+      if (cur === null) { headerLines++; continue; }  // header before the first date line → left out
+      if (cur >= from && cur <= to) {
+        out.push(line);
+        hitDates.add(cur);
+      }
+    }
+  }
+  return {
+    text: out.length ? out.join('\n') + '\n' : '',
+    outLines: out.length,
+    hitDays: hitDates.size,
+    spanMin: minD, spanMax: maxD,
+    headerLines, invalidDateLines
+  };
+}
+</script>
+
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  let picked = [];
+
+  const drop = $('drop');
+  drop.addEventListener('click', () => $('fileInput').click());
+  $('fileInput').addEventListener('change', () => { addFiles([...$('fileInput').files]); $('fileInput').value = ''; });
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+  drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); addFiles([...e.dataTransfer.files]); });
+
+  function showPickWarn(notices, errors) {
+    const el = $('pickWarn');
+    el.textContent = '';
+    for (const [cls, list] of [['err', errors], ['warn', notices]]) {
+      for (const msg of list) {
+        const s = document.createElement('span');
+        s.className = cls; s.textContent = (cls === 'err' ? '✗ ' : '⚠ ') + msg;
+        el.appendChild(s);
+      }
+    }
+  }
+
+  let pickSeq = 0;
+  async function addFiles(files) {
+    const my = ++pickSeq;
+    picked = []; $('run').disabled = true;            // never run on the previous selection while reading
+    $('pickSummary').textContent = 'Reading…'; $('pickWarn').textContent = '';
+    const r = await collectTxtInputs(files);
+    if (my !== pickSeq) return;                       // a newer choice replaced this one while it was read
+    showPickWarn(r.notices, r.errors);
+    picked = r.errors.length ? [] : r.items;
+    $('pickSummary').textContent = r.errors.length
+      ? 'These files cannot be used — see below, fix and choose again'
+      : picked.length
+        ? picked.length + ' file' + (picked.length > 1 ? 's' : '') + ' selected (' + picked[0].name + (picked.length > 1 ? ' … ' + picked[picked.length - 1].name : '') + ')'
+        : 'No .txt files found (none inside the zip either)';
+    $('run').disabled = picked.length === 0;
+    $('status').classList.remove('show');
+  }
+
+  function setStatus(html) { const el = $('status'); el.innerHTML = html; el.classList.add('show'); }
+
+  $('run').addEventListener('click', () => {
+    const from = parseUserDate($('fromInput').value);
+    const to = parseUserDate($('toInput').value);
+    if (from === null || to === null) {
+      setStatus('<span class="err">Invalid date: enter a date that exists as 8 digits, e.g. 20240101 (year, month, day).</span>');
+      return;
+    }
+    if (from > to) {
+      setStatus('<span class="err">“From” is later than “To” (' + fmtYMD(from) + ' → ' + fmtYMD(to) + '). Swap them.</span>');
+      return;
+    }
+    $('run').disabled = true;
+    try {
+      const r = extractRange(picked.map(f => decodeTextSmart(f.bytes)), from, to);
+      const spanTxt = r.spanMin !== null
+        ? 'Dates in the files: ' + fmtYMD(r.spanMin) + ' to ' + fmtYMD(r.spanMax)
+        : 'No date lines were found in the files';
+      const invalidTxt = r.invalidDateLines
+        ? '<br><span class="warn">⚠ ' + r.invalidDateLines + ' line(s) look like dates that do not exist (e.g. 30 February, or month/day/year) and were kept as normal text.</span>'
+        : '';
+      if (r.hitDays === 0) {
+        setStatus('<span class="warn">⚠ No days in this range.</span><br>' + spanTxt + '.<br>' +
+          (r.spanMin === null
+            ? 'The date format may not match (supported: date-only lines such as 30/12/2024 (Mon), 2024/12/30, 2024年12月30日).'
+            : 'Check whether the range is outside the dates above.') + invalidTxt);
+        return;
+      }
+      const blob = new Blob([r.text], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'line_extracted_' + String(from) + '-' + String(to) + '.txt';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      setStatus('<span class="ok">✓ Done</span><br>' + spanTxt + '.<br>' +
+        fmtYMD(from) + ' to ' + fmtYMD(to) + ': <b>' + r.hitDays + '</b> day(s), <b>' + r.outLines + '</b> line(s), about ' +
+        (r.text.length / 1000).toFixed(1) + 'k characters. The download has started.' + invalidTxt);
+    } catch (err) {
+      setStatus('<span class="err">Something went wrong: ' + esc(err && err.message ? err.message : err) + '</span>');
+    } finally {
+      $('run').disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

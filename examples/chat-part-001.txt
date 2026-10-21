@@ -1,0 +1,11 @@
+[LINE] Chat history with Reading Club (demo)
+Saved on: 2024/03/02 21:00
+
+2024/01/30 (Tue)
+09:12	Demo User A	Morning! Can we move today's reading club to 3 pm?
+09:15	Demo User B	Sure, I'll bring my notes from last time.
+2024/01/31 (Wed)
+20:01	Demo User A	Remember to bring a water bottle tomorrow.
+20:03	Demo User B	Got it.
+2024/02/01 (Thu)
+08:30	Demo User B	Heading out now

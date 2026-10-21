@@ -1,0 +1,12 @@
+08:45	Demo User A	OK, safe travels.
+12:00	Demo User B	Had curry rice for lunch.
+2024/02/02 (Fri)
+18:20	Demo User A	See you at the park tomorrow.
+03/02/2024 (Sat)
+10:00	Demo User B	Have a nice weekend!
+2024.02.04 (Sun)
+15:30	Demo User A	Finished the book today.
+2024/02/29 (Thu)
+21:00	Demo User B	Leap day!
+2024/03/01 (Fri)
+07:50	Demo User A	March already.

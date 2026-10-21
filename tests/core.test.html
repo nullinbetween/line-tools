@@ -1,0 +1,346 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>line-tools core tests</title>
+<style>body{font:13px/1.5 ui-monospace,Menlo,monospace;padding:16px}.p{color:#1d7a37}.f{color:#b3261e;font-weight:700}</style>
+</head><body>
+<h1>line-tools — core tests</h1>
+<p>Serve the project folder over HTTP (e.g. <code>python3 -m http.server 8765 --bind 127.0.0.1</code>) and open
+<code>/tests/core.test.html</code>. Uses only the fictional chats in <code>examples/</code> and zip/docx files built inside the test.</p>
+<pre id="out">running…</pre>
+<script>
+(async function () {
+  const out = document.getElementById('out');
+  const results = [];
+  const get = async p => (await fetch(p, { cache: 'no-store' })).text();
+  const coreOf = html => (/<script id="core-logic">([\s\S]*?)<\/script>/.exec(html) || [])[1];
+  // Each tool's core runs in its own function scope, as it does in its own page.
+  const load = (code, names) => new Function(code + '\nreturn {' + names.join(',') + '};')();
+
+  const H = {
+    ex: await get('../date-extractor.html'),
+    me: await get('../merger.html'),
+    sp: await get('../splitter.html')
+  };
+  const SHARED = ['LIMITS', 'esc', 'isRealDate', 'matchDateLine', 'decodeTextSmart', 'parseZipEntries', 'extractZipEntry', 'collectTxtInputs'];
+  const EX = load(coreOf(H.ex), SHARED.concat(['parseDateLineYMD', 'parseUserDate', 'extractRange']));
+  const ME = load(coreOf(H.me), SHARED.concat(['mergeByDate', 'bucketsToZipFiles', 'buildZip', 'crc32']));
+  const SP = load(coreOf(H.sp), SHARED.concat(['chunkByDateBlocks', 'chunkByChars', 'safeCutIndex', 'fragmentToText', 'docxToPages', 'buildZip', 'sanitizePrefix', 'pagesToBatchFiles', 'txtToPages']));
+
+  const FX = {
+    p1: await get('../examples/chat-part-001.txt'),
+    p2: await get('../examples/chat-part-002.txt'),
+    bad: await get('../examples/chat-invalid-dates.txt')
+  };
+  const enc = new TextEncoder();
+  const file = (name, text) => new File([typeof text === 'string' ? enc.encode(text) : text], name);
+
+  function eq(a, b, msg) { if (a !== b) throw new Error((msg ? msg + ': ' : '') + 'expected ' + JSON.stringify(b) + ', got ' + JSON.stringify(a)); }
+  function ok(v, msg) { if (!v) throw new Error(msg || 'expected truthy'); }
+  async function test(name, fn) {
+    try { await fn(); results.push({ name, pass: true }); }
+    catch (e) { results.push({ name, pass: false, err: String(e && e.message || e) }); }
+  }
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  // Generic zip writer for crafting test archives (STORE or DEFLATE, optional bad headers).
+  async function deflateRaw(u8) {
+    const s = new Blob([u8]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+    return new Uint8Array(await new Response(s).arrayBuffer());
+  }
+  async function craftZip(entries, opt) {
+    opt = opt || {};
+    const parts = [], central = [];
+    let offset = 0;
+    for (const e of entries) {
+      const name = enc.encode(e.name);
+      const data = typeof e.data === 'string' ? enc.encode(e.data) : e.data;
+      const method = e.method || 0;
+      const body = method === 8 ? await deflateRaw(data) : data;
+      const size = e.declaredSize != null ? e.declaredSize : data.length;
+      const flags = 0x0800 | (e.encrypted ? 1 : 0);
+      const crc = e.badCrc ? (ME.crc32(data) ^ 1) >>> 0 : ME.crc32(data);
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, flags, true); lh.setUint16(8, method, true);
+      lh.setUint32(14, crc, true); lh.setUint32(18, body.length, true); lh.setUint32(22, size, true); lh.setUint16(26, name.length, true);
+      parts.push(new Uint8Array(lh.buffer), name, body);
+      const ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, flags, true);
+      ch.setUint16(10, method, true); ch.setUint32(16, crc, true); ch.setUint32(20, body.length, true); ch.setUint32(24, size, true);
+      ch.setUint16(28, name.length, true); ch.setUint32(42, offset, true);
+      central.push(new Uint8Array(ch.buffer), name);
+      offset += 30 + name.length + body.length;
+    }
+    const cdSize = central.reduce((s, p) => s + p.length, 0);
+    const eocd = new DataView(new ArrayBuffer(22));
+    const count = opt.zip64 ? 0xFFFF : entries.length;
+    eocd.setUint32(0, 0x06054b50, true); eocd.setUint16(8, count, true); eocd.setUint16(10, count, true);
+    eocd.setUint32(12, cdSize, true); eocd.setUint32(16, offset, true);
+    const all = [...parts, ...central, new Uint8Array(eocd.buffer)];
+    const u8 = new Uint8Array(all.reduce((s, p) => s + p.length, 0));
+    let p = 0; for (const a of all) { u8.set(a, p); p += a.length; }
+    return u8;
+  }
+
+  // ---- the shared block is identical in all three tools ----
+  const sharedOf = html => (/\/\* ============ Shared core[\s\S]*?return \{ items: unique, notices, errors \};\n\}/.exec(html) || [''])[0];
+  await test('shared core block is identical in all three tools', () => {
+    const a = sharedOf(H.ex), b = sharedOf(H.me), c = sharedOf(H.sp);
+    ok(a.length > 1000, 'shared block not found'); eq(a, b, 'merger'); eq(a, c, 'splitter');
+  });
+
+  // ---- real dates ----
+  await test('parseUserDate: leap-year Feb 29 accepted, non-leap Feb 29 rejected', () => { eq(EX.parseUserDate('20240229'), 20240229); eq(EX.parseUserDate('20230229'), null); });
+  await test('parseUserDate: Apr 31, month 13 and day 0 rejected', () => { eq(EX.parseUserDate('20240431'), null); eq(EX.parseUserDate('20241301'), null); eq(EX.parseUserDate('20240100'), null); });
+  await test('parseUserDate: separators tolerated, too few digits rejected', () => { eq(EX.parseUserDate('2024-01-01'), 20240101); eq(EX.parseUserDate('2024/1/1'), null); eq(EX.parseUserDate(''), null); });
+  await test('matchDateLine: supported formats', () => {
+    eq(EX.parseDateLineYMD('2024/01/30 (Tue)'), 20240130);
+    eq(EX.parseDateLineYMD('2024/01/30（二）'), 20240130);
+    eq(EX.parseDateLineYMD('30/01/2024 (Tue)'), 20240130);
+    eq(EX.parseDateLineYMD('2024年1月30日'), 20240130);
+    eq(EX.parseDateLineYMD('2024.01.30'), 20240130);
+    eq(EX.parseDateLineYMD('03/02/2024 (Sat)'), 20240203, 'day/month/year');
+  });
+  await test('matchDateLine: date-shaped but impossible → valid=false', () => {
+    eq(EX.matchDateLine('2024/02/30 (Fri)').valid, false);
+    eq(EX.matchDateLine('12/31/2024').valid, false);
+    eq(EX.matchDateLine('2023/02/29').valid, false);
+  });
+  await test('matchDateLine: a message line is not a date line', () => { eq(EX.matchDateLine('09:12\tA\t2024/01/30'), null); eq(EX.matchDateLine('hello'), null); });
+  await test('matchDateLine: a date followed by other words is a message, not a date line', () => {
+    eq(EX.matchDateLine('2024/03/01休假'), null); eq(EX.matchDateLine('2024/03/01 day off'), null); eq(EX.matchDateLine('2024/03/01 (holiday!)'), null);
+  });
+  await test('matchDateLine: weekdays written out are accepted', () => {
+    for (const l of ['2024/03/01 Friday', '2024/03/01 Fri.', '2024/03/01 星期五', '2024/03/01 週五', '2024/03/01(金)', '2024/03/01 金曜日'])
+      eq(EX.parseDateLineYMD(l), 20240301, l);
+  });
+  await test('matchDateLine: only real weekday names count after a date', () => {
+    for (const l of ['2024/03/01 Monsoon', '2024/03/01 Sunshine', '2024/03/01 Saturnalia', '2024/03/01 Mondays', '2024/03/01 (lol)', '2024/03/01（笑）', '2024/03/01 Fri Fri'])
+      eq(EX.matchDateLine(l), null, l);
+    for (const l of ['2024/03/07 Thurs', '2024/03/07 (Thu.)', '2024/03/07 thursday', '2024/03/07 (목)', '2024/03/07（週四）', '2024/03/07 (木曜日)'])
+      eq(EX.parseDateLineYMD(l), 20240307, l);
+  });
+  await test('extract: a message that starts with a date does not switch the day', () => {
+    const t = '2024/02/29 (Thu)\n2024/03/01休假\n10:00\tA\tstill Feb 29\n2024/03/01 (Fri)\n11:00\tB\tMarch\n';
+    const r = EX.extractRange([t], 20240229, 20240229);
+    ok(r.text.includes('2024/03/01休假') && r.text.includes('still Feb 29') && !r.text.includes('March'), r.text);
+  });
+
+  // ---- extraction (days across files, header) ----
+  await test('extract: Feb 1 continues from the first file into the second', () => {
+    const r = EX.extractRange([FX.p1, FX.p2], 20240201, 20240201);
+    eq(r.hitDays, 1); ok(r.text.includes('safe travels'), 'missing continued line'); ok(r.text.includes('Heading out now'));
+    ok(!r.text.includes('park tomorrow'), 'Feb 2 must be excluded');
+  });
+  await test('extract: the header before the first date line is left out', () => {
+    const r = EX.extractRange([FX.p1], 20000101, 20991231);
+    ok(!r.text.includes('Saved on')); eq(r.headerLines, 3);
+  });
+  await test('extract: day/month/year and year.month.day both count; span is right', () => {
+    const r = EX.extractRange([FX.p1, FX.p2], 20240203, 20240204);
+    eq(r.hitDays, 2); eq(r.spanMin, 20240130); eq(r.spanMax, 20240301);
+  });
+  await test('extract: impossible date lines stay as content and are counted', () => {
+    const r = EX.extractRange([FX.bad], 20240203, 20240203);
+    eq(r.invalidDateLines, 3); ok(r.text.includes('still belongs to Feb 3')); ok(r.text.includes('2023 has no Feb 29'));
+  });
+
+  // ---- text decoding ----
+  await test('decodeTextSmart: UTF-8 / UTF-8 BOM / UTF-16LE BOM / Big5', () => {
+    eq(EX.decodeTextSmart(enc.encode('中文')), '中文');
+    eq(EX.decodeTextSmart(new Uint8Array([0xEF, 0xBB, 0xBF, ...enc.encode('中文')])), '中文');
+    eq(EX.decodeTextSmart(new Uint8Array([0xFF, 0xFE, 0x2D, 0x4E, 0x87, 0x65])), '中文');
+    eq(EX.decodeTextSmart(new Uint8Array([0xA4, 0xA4, 0xA4, 0xE5])), '中文');
+  });
+
+  // ---- collecting inputs: duplicate names, formats, sizes, zips ----
+  await test('same name and same content: used once, with a notice', async () => {
+    const r = await EX.collectTxtInputs([file('a.txt', 'x'), file('a.txt', 'x'), file('b.txt', 'y')]);
+    eq(r.errors.length, 0); eq(r.items.length, 2); ok(r.notices.some(n => n.includes('a.txt (×2)')), JSON.stringify(r.notices));
+  });
+  await test('same name, different content: error asking to rename', async () => {
+    const r = await EX.collectTxtInputs([file('a.txt', 'x'), file('a.txt', 'z')]);
+    ok(r.errors.some(e => e.includes('a.txt') && e.includes('Rename')), JSON.stringify(r.errors));
+  });
+  await test('files that are not .txt are skipped with a notice', async () => {
+    const r = await EX.collectTxtInputs([file('a.txt', 'x'), file('b.docx', 'y')]);
+    eq(r.items.length, 1); ok(r.notices.some(n => n.includes('b.docx')));
+  });
+  await test('file names are sorted in natural order', async () => {
+    const r = await EX.collectTxtInputs([file('p_10.txt', '1'), file('p_2.txt', '2'), file('p_1.txt', '3')]);
+    eq(r.items.map(i => i.name).join(','), 'p_1.txt,p_2.txt,p_10.txt');
+  });
+  await test('over the per-file limit → error', async () => {
+    const old = EX.LIMITS.maxFileBytes; EX.LIMITS.maxFileBytes = 5;
+    try { const r = await EX.collectTxtInputs([file('big.txt', '1234567890')]); ok(r.errors.some(e => e.includes('big.txt')), JSON.stringify(r.errors)); }
+    finally { EX.LIMITS.maxFileBytes = old; }
+  });
+  await test('zip: STORE and DEFLATE both read; __MACOSX, hidden files and non-.txt skipped', async () => {
+    const z = await craftZip([
+      { name: 'chats/chat-part-001.txt', data: FX.p1 },
+      { name: 'chats/chat-part-002.txt', data: FX.p2, method: 8 },
+      { name: '__MACOSX/chats/._chat-part-001.txt', data: 'junk' },
+      { name: 'chats/.DS_Store', data: 'junk' },
+      { name: 'chats/photo.png', data: 'junk' }
+    ]);
+    const r = await EX.collectTxtInputs([file('chats.zip', z)]);
+    eq(r.errors.length, 0, JSON.stringify(r.errors)); eq(r.items.length, 2);
+    eq(EX.decodeTextSmart(r.items[1].bytes), FX.p2);
+    ok(r.notices.some(n => n.includes('photo.png')), JSON.stringify(r.notices));
+  });
+  await test('a zip and a loose file with the same name and content → used once', async () => {
+    const z = await craftZip([{ name: 'chat-part-001.txt', data: FX.p1, method: 8 }]);
+    const r = await EX.collectTxtInputs([file('chat-part-001.txt', FX.p1), file('c.zip', z)]);
+    eq(r.errors.length, 0); eq(r.items.length, 1);
+  });
+  await test('zip: encrypted entry → error', async () => {
+    const r = await EX.collectTxtInputs([file('e.zip', await craftZip([{ name: 'a.txt', data: 'x', encrypted: true }]))]);
+    ok(r.errors.some(e => e.toLowerCase().includes('encrypted')), JSON.stringify(r.errors));
+  });
+  await test('zip: ZIP64 → error', async () => {
+    const r = await EX.collectTxtInputs([file('z.zip', await craftZip([{ name: 'a.txt', data: 'x' }], { zip64: true }))]);
+    ok(r.errors.some(e => e.includes('ZIP64')), JSON.stringify(r.errors));
+  });
+  await test('zip: declared size differs from actual → error', async () => {
+    const r = await EX.collectTxtInputs([file('s.zip', await craftZip([{ name: 'a.txt', data: 'hello', method: 8, declaredSize: 3 }]))]);
+    ok(r.errors.some(e => e.includes('mismatch')), JSON.stringify(r.errors));
+  });
+  await test('zip: unpacking stops when the total limit is passed (zip-bomb guard)', async () => {
+    const old = EX.LIMITS.maxTotalBytes; EX.LIMITS.maxTotalBytes = 1000;
+    try {
+      const z = await craftZip([{ name: 'a.txt', data: new Uint8Array(20000), method: 8, declaredSize: 10 }]);
+      const r = await EX.collectTxtInputs([file('bomb.zip', z)]);
+      ok(r.errors.some(e => e.includes('limit')), JSON.stringify(r.errors));
+    } finally { EX.LIMITS.maxTotalBytes = old; }
+  });
+  await test('zip: CRC mismatch (damaged content) → error', async () => {
+    const r = await EX.collectTxtInputs([file('c.zip', await craftZip([{ name: 'a.txt', data: 'hello', method: 8, badCrc: true }]))]);
+    ok(r.errors.some(e => e.includes('CRC')), JSON.stringify(r.errors));
+  });
+  await test('a .zip that is not a zip → error', async () => {
+    const r = await EX.collectTxtInputs([file('x.zip', 'this is not a zip at all, just text')]);
+    ok(r.errors.some(e => e.includes('Not a valid zip')), JSON.stringify(r.errors));
+  });
+
+  // ---- merging ----
+  await test('merge (month): days across files and months are filed correctly', () => {
+    const r = ME.mergeByDate([{ name: '1', text: FX.p1 }, { name: '2', text: FX.p2 }], 'month');
+    eq(r.keys.join(','), '2024-01,2024-02,2024-03,undated');
+    ok(r.buckets.get('2024-02').lines.includes('08:45\tDemo User A\tOK, safe travels.'));
+    const names = ME.bucketsToZipFiles(r, 'month').map(f => f.name);
+    ok(names.includes('merged/2024/2024-01.txt') && names.includes('merged/undated.txt'), names.join(','));
+  });
+  await test('merge (year / all)', () => {
+    eq(ME.mergeByDate([{ name: '1', text: FX.p1 }], 'year').keys.join(','), '2024,undated');
+    eq(ME.mergeByDate([{ name: '1', text: FX.p1 }], 'all').keys.join(','), 'all');
+  });
+  await test('merge: impossible dates do not open a new month', () => {
+    const r = ME.mergeByDate([{ name: 'b', text: FX.bad }], 'month');
+    eq(r.keys.join(','), '2024-02'); eq(r.invalidDateLines, 3);
+  });
+  await test('merge: the output zip can be read back', async () => {
+    const r = ME.mergeByDate([{ name: '1', text: FX.p1 }], 'month');
+    const zipU8 = ME.buildZip(ME.bucketsToZipFiles(r, 'month'));
+    const ents = ME.parseZipEntries(zipU8.buffer);
+    eq(ents.length, r.keys.length);
+    const back = await ME.extractZipEntry(zipU8.buffer, ents[0], 1e6);
+    ok(ME.decodeTextSmart(back).includes('2024/01/30'));
+  });
+  await test('merge: more output files than the limit → error, no broken zip', () => {
+    let msg = '';
+    try { ME.buildZip(Array.from({ length: ME.LIMITS.maxOutputFiles + 1 }, (_, i) => ({ name: i + '.txt', data: new Uint8Array(0) }))); } catch (e) { msg = e.message; }
+    ok(msg.includes('limit'), msg);
+  });
+
+  // ---- splitting ----
+  await test('split: cuts only at real date lines, never inside a day', () => {
+    const r = SP.chunkByDateBlocks(FX.p1 + FX.p2, 150);
+    ok(r.pages.length >= 3, 'expected several pages, got ' + r.pages.length);
+    r.pages.slice(1).forEach((p, i) => ok((SP.matchDateLine(p.split('\n')[0]) || {}).valid, 'page ' + (i + 2) + ' starts mid-day: ' + p.split('\n')[0]));
+    eq(r.dateLines, 8); eq(r.longDays, 0);
+    eq(r.pages.join(''), FX.p1 + FX.p2, 'joining the chunks gives the text back exactly');
+  });
+  await test('split by length keeps lines whole when they fit; only a line longer than a page is cut', () => {
+    const text = 'aaaa\nbbbbbb\ncc\n' + 'x'.repeat(25) + '\ndd';
+    const pages = SP.chunkByChars(text, 10);
+    eq(pages.join(''), text, 'exact');
+    eq(pages[0], 'aaaa\n'); eq(pages[1], 'bbbbbb\ncc\n');               // "bbbbbb" moves to the next page instead of being cut
+    ok(pages.every(p => p.length <= 10), pages.map(p => p.length).join(','));
+    eq(pages.filter(p => p.startsWith('x')).length, 3, 'the 26-character line is the only one cut');
+  });
+  await test('split: a single day longer than the limit is cut by length and counted', () => {
+    const long = '2024/03/01 (Fri)\n' + '10:00\tA\tlong message\n'.repeat(40) + '2024/03/02 (Sat)\n11:00\tB\tshort\n';
+    const r = SP.chunkByDateBlocks(long, 200);
+    eq(r.longDays, 1); ok(r.pages.length > 3, 'the long day spans several chunks');
+    eq(r.pages.join(''), long, 'no text lost or added');
+    ok(r.pages[r.pages.length - 1].startsWith('2024/03/02'), 'the next day still starts a new chunk');
+  });
+  await test('split: impossible date lines are not cut points, and are counted', () => {
+    const r = SP.chunkByDateBlocks(FX.bad, 1000);
+    eq(r.invalidDateLines, 3); eq(r.dateLines, 1); eq(r.pages.length, 1); ok(r.pages[0].includes('2024/02/30'));
+  });
+  await test('split by length never breaks an emoji or a rare character (no “�”)', () => {
+    const text = 'ab😀cd😀ef𠀋gh😀'.repeat(40);           // surrogate pairs at many odd/even offsets
+    for (const size of [50, 51, 52, 53, 97, 100]) {
+      const pages = SP.chunkByChars(text, size);
+      pages.forEach((p, i) => {
+        ok(!LONE_SURROGATE.test(p), `size ${size}, page ${i}: lone surrogate`);
+        ok(!new TextDecoder().decode(enc.encode(p)).includes('�'), `size ${size}, page ${i}: U+FFFD after encoding`);
+      });
+      eq(pages.join(''), text, `size ${size}: content changed`);
+    }
+  });
+  await test('split by length keeps emoji sequences (flags, ZWJ families) whole', () => {
+    if (typeof Intl === 'undefined' || !Intl.Segmenter) return;   // fallback still avoids broken surrogates (tested above)
+    const fam = '👨‍👩‍👧', flag = '🇯🇵';
+    const text = ('x' + fam + flag).repeat(30);
+    for (const size of [5, 6, 7, 8, 9, 10, 11, 12, 13]) {
+      for (const p of SP.chunkByChars(text, size)) {
+        const body = p.replace(/\n/g, '');
+        const segs = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(body)].map(s => s.segment);
+        ok(segs.every(s => s === 'x' || s === fam || s === flag), `size ${size}: a sequence was split → ${JSON.stringify(body)}`);
+      }
+    }
+  });
+  await test('safeCutIndex: always advances, even when the first character is wider than the room', () => {
+    eq(SP.safeCutIndex('😀abc', 1), 2); eq(SP.safeCutIndex('abc', 2), 2); eq(SP.safeCutIndex('a😀', 2), 1);
+  });
+  await test('split .docx: page-break markers → pages', async () => {
+    const xml = '<w:document><w:body><w:p><w:r><w:t>Page one</w:t></w:r></w:p><w:p><w:r><w:br w:type="page"/><w:t>Page two &amp; symbol</w:t></w:r></w:p>'
+      + '<w:p><w:r><w:lastRenderedPageBreak/><w:t>Page three</w:t></w:r></w:p></w:body></w:document>';
+    const z = await craftZip([{ name: '[Content_Types].xml', data: '<Types/>' }, { name: 'word/document.xml', data: xml, method: 8 }]);
+    const ents = SP.parseZipEntries(z.buffer);
+    const doc = ents.find(e => e.name === 'word/document.xml');
+    const r = SP.docxToPages(SP.decodeTextSmart(await SP.extractZipEntry(z.buffer, doc, 1e6)), 1000);
+    eq(r.usedMarkers, true); eq(r.pages.length, 3); ok(r.pages[1].includes('Page two & symbol'));
+  });
+  await test('split .docx: tabs in the text are kept (A⇥B stays A⇥B)', () => {
+    eq(SP.fragmentToText('<w:p><w:r><w:t>A</w:t><w:tab/><w:t>B</w:t></w:r></w:p>'), 'A\tB\n');
+    eq(SP.fragmentToText('<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr><w:r><w:t>C</w:t></w:r></w:p>'), 'C\n', 'tab-stop definitions are not tabs');
+  });
+  await test('split .docx: no page-break markers → estimated by length', () => {
+    const r = SP.docxToPages('<w:body><w:p><w:r><w:t>' + 'あ'.repeat(250) + '</w:t></w:r></w:p></w:body>', 100);
+    eq(r.usedMarkers, false); eq(r.pages.length, 3);
+  });
+  await test('split: the file-name prefix loses path and reserved characters', () => {
+    const p = SP.sanitizePrefix('../../evil:name');
+    ok(!p.includes('/') && !p.startsWith('.') && !p.includes(':'), p);
+    eq(SP.sanitizePrefix('   '), 'line');
+  });
+  await test('split: numbered file names with consistent width', () => {
+    const files = SP.pagesToBatchFiles(Array.from({ length: 12 }, (_, i) => 'p' + i), 1, 'demo', 'demo_split');
+    eq(files[0].name, 'demo_split/demo_001.txt'); eq(files[11].name, 'demo_split/demo_012.txt');
+  });
+  await test('split: more output files than the limit → clear error before building the zip', () => {
+    let msg = '';
+    try { SP.pagesToBatchFiles(Array.from({ length: SP.LIMITS.maxOutputFiles + 1 }, () => 'x'), 1, 'p', 'f'); } catch (e) { msg = e.message; }
+    ok(msg.includes('limit') && msg.includes('larger size'), msg);
+  });
+
+  const failed = results.filter(r => !r.pass);
+  out.innerHTML = results.map(r => r.pass ? '<span class="p">PASS</span> ' + r.name
+    : '<span class="f">FAIL</span> ' + r.name + ' — ' + r.err.replace(/</g, '&lt;')).join('\n')
+    + '\n\n' + (results.length - failed.length) + '/' + results.length + ' passed';
+  document.title = (failed.length ? 'FAIL ' : 'PASS ') + (results.length - failed.length) + '/' + results.length;
+  window.__TEST_RESULTS__ = results;
+})();
+</script>
+</body></html>
